@@ -16,6 +16,76 @@ struct CachedCallingPoints {
 };
 static CachedCallingPoints sCpCache[MAX_SERVICES];
 
+// Wrapper around NetworkClientSecure/WiFiClient so ArduinoJson does not get premature -1 (EOF)
+// when available() == 0 between two incoming TCP/TLS packets.
+class BlockingHttpStream : public Stream {
+public:
+    explicit BlockingHttpStream(WiFiClient* client, unsigned long timeoutMs = 8000)
+        : _client(client), _timeoutMs(timeoutMs) {}
+
+    int available() override {
+        return _client ? _client->available() : 0;
+    }
+
+    int read() override {
+        if (!_client) {
+            return -1;
+        }
+        unsigned long start = millis();
+        while (_client->available() <= 0) {
+            if (!_client->connected() || (millis() - start >= _timeoutMs)) {
+                return -1;
+            }
+            delay(1);
+        }
+        return _client->read();
+    }
+
+    int peek() override {
+        if (!_client) {
+            return -1;
+        }
+        unsigned long start = millis();
+        while (_client->available() <= 0) {
+            if (!_client->connected() || (millis() - start >= _timeoutMs)) {
+                return -1;
+            }
+            delay(1);
+        }
+        return _client->peek();
+    }
+
+    size_t readBytes(char* buffer, size_t length) override {
+        if (!_client || length == 0) {
+            return 0;
+        }
+        size_t totalRead = 0;
+        unsigned long start = millis();
+        while (totalRead < length) {
+            int avail = _client->available();
+            if (avail > 0) {
+                size_t toRead = min(length - totalRead, (size_t)avail);
+                int r = _client->read(reinterpret_cast<uint8_t*>(buffer + totalRead), toRead);
+                if (r > 0) {
+                    totalRead += (size_t)r;
+                    start = millis();
+                }
+            } else if (!_client->connected() || (millis() - start >= _timeoutMs)) {
+                break;
+            } else {
+                delay(1);
+            }
+        }
+        return totalRead;
+    }
+
+    size_t write(uint8_t) override { return 0; }
+
+private:
+    WiFiClient* _client;
+    unsigned long _timeoutMs;
+};
+
 String TrainApiClient::stripHtmlAndClean(const String& input) {
     String out;
     out.reserve(input.length());
@@ -375,12 +445,15 @@ bool TrainApiClient::fetchFromRailFeed(const AppConfig& config, BoardData& board
     String filterCrs = config.filterCrs;
     filterCrs.toUpperCase();
 
-    // First try a 2-hour window (compact & fast during the day)
-    if (!fetchRailFeedWindow(crs, filterCrs, 2, board)) {
+    // First try a 1-hour window (compact & fast during the day)
+    if (!fetchRailFeedWindow(crs, filterCrs, 1, board)) {
         return false;
     }
 
-    // If fewer than 3 passenger services found (e.g. overnight or rural station), expand to 10 hours
+    // If fewer than 3 passenger services found, expand to 3 hours, then 10 hours overnight
+    if (board.serviceCount < 3) {
+        fetchRailFeedWindow(crs, filterCrs, 3, board);
+    }
     if (board.serviceCount < 3) {
         fetchRailFeedWindow(crs, filterCrs, 10, board);
     }
@@ -448,10 +521,12 @@ bool TrainApiClient::fetchRailFeedWindow(const String& crs, const String& filter
     svcFilter["consist"][0]["vehicle_count"] = true;
 
     JsonDocument doc;
+    BlockingHttpStream blockingStream(http.getStreamPtr(), 10000);
     DeserializationError err = deserializeJson(
         doc,
-        http.getStream(),
-        DeserializationOption::Filter(filter)
+        blockingStream,
+        DeserializationOption::Filter(filter),
+        DeserializationOption::NestingLimit(15)
     );
     http.end();
     secureClient.stop();
@@ -676,10 +751,12 @@ bool TrainApiClient::fetchRailFeedCallingPoints(
     stopFilter["status"] = true;
 
     JsonDocument doc;
+    BlockingHttpStream blockingStream(http.getStreamPtr(), 10000);
     DeserializationError err = deserializeJson(
         doc,
-        http.getStream(),
-        DeserializationOption::Filter(filter)
+        blockingStream,
+        DeserializationOption::Filter(filter),
+        DeserializationOption::NestingLimit(15)
     );
     http.end();
     secureClient.stop();
