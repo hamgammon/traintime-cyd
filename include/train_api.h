@@ -9,6 +9,7 @@ public:
 private:
     static bool fetchFromHuxley2(const AppConfig& config, BoardData& board);
     static bool fetchFromRailFeed(const AppConfig& config, BoardData& board);
+    static bool refreshRailFeedPageToken();
     static bool fetchRailFeedWindow(const String& crs, const String& filterCrs, uint8_t hours, BoardData& board);
     static bool fetchRailFeedCallingPoints(const String& uid, const String& dateStr, const String& originCrs, TrainService& svc);
 

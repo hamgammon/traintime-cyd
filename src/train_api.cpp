@@ -286,7 +286,7 @@ bool TrainApiClient::fetchFromHuxley2(const AppConfig& config, BoardData& board)
     }
 
     http.addHeader("Accept", "application/json");
-    http.addHeader("User-Agent", "TrainTime-CYD/1.1");
+    http.addHeader("User-Agent", "TrainTime-CYD/1.2");
 
     int httpCode = http.GET();
     if (httpCode != HTTP_CODE_OK) {
@@ -439,11 +439,59 @@ bool TrainApiClient::fetchFromHuxley2(const AppConfig& config, BoardData& board)
 // RailFeed Fallback Provider (https://railfeed.co.uk)
 // ============================================================================
 
+static String sRailFeedCookie = "";
+static unsigned long sRailFeedCookieTime = 0;
+
+bool TrainApiClient::refreshRailFeedPageToken() {
+    WiFiClientSecure secureClient;
+    HTTPClient http;
+
+    secureClient.setInsecure();
+    http.setTimeout(8000);
+    if (!http.begin(secureClient, "https://railfeed.co.uk/data/page_token")) {
+        return false;
+    }
+
+    const char* headerKeys[] = {"Set-Cookie", "set-cookie"};
+    http.collectHeaders(headerKeys, 2);
+    http.addHeader("User-Agent", "Mozilla/5.0 (compatible; TrainTime-CYD/1.2)");
+
+    int code = http.GET();
+    String setCookie = http.header("Set-Cookie");
+    if (setCookie.isEmpty()) {
+        setCookie = http.header("set-cookie");
+    }
+    http.end();
+    secureClient.stop();
+
+    if (code <= 0 || setCookie.isEmpty()) {
+        Serial.printf("[TrainAPI] page_token HTTP %d (no Set-Cookie)\n", code);
+        return false;
+    }
+
+    int idx = setCookie.indexOf("rf_pt=");
+    if (idx < 0) {
+        return false;
+    }
+    int semi = setCookie.indexOf(';', idx);
+    sRailFeedCookie = (semi > idx) ? setCookie.substring(idx, semi) : setCookie.substring(idx);
+    sRailFeedCookie.trim();
+    sRailFeedCookieTime = millis();
+    Serial.printf("[TrainAPI] Obtained RailFeed page_token cookie (%u chars)\n",
+                  (unsigned int)sRailFeedCookie.length());
+    return !sRailFeedCookie.isEmpty();
+}
+
 bool TrainApiClient::fetchFromRailFeed(const AppConfig& config, BoardData& board) {
     String crs = config.stationCrs;
     crs.toUpperCase();
     String filterCrs = config.filterCrs;
     filterCrs.toUpperCase();
+
+    // Refresh the 15-minute page_token cookie if missing or older than 12 minutes
+    if (sRailFeedCookie.isEmpty() || (millis() - sRailFeedCookieTime >= 720000UL)) {
+        refreshRailFeedPageToken();
+    }
 
     // First try a 1-hour window (compact & fast during the day)
     if (!fetchRailFeedWindow(crs, filterCrs, 1, board)) {
@@ -482,9 +530,25 @@ bool TrainApiClient::fetchRailFeedWindow(const String& crs, const String& filter
     }
 
     http.addHeader("Accept", "application/json");
-    http.addHeader("User-Agent", "TrainTime-CYD/1.1");
+    http.addHeader("User-Agent", "Mozilla/5.0 (compatible; TrainTime-CYD/1.2)");
+    if (!sRailFeedCookie.isEmpty()) {
+        http.addHeader("Cookie", sRailFeedCookie);
+    }
 
     int httpCode = http.GET();
+    // If token expired (403), fetch a fresh page_token cookie and retry once
+    if (httpCode == 403) {
+        http.end();
+        secureClient.stop();
+        if (refreshRailFeedPageToken() && http.begin(secureClient, url)) {
+            http.useHTTP10(true);
+            http.addHeader("Accept", "application/json");
+            http.addHeader("User-Agent", "Mozilla/5.0 (compatible; TrainTime-CYD/1.2)");
+            http.addHeader("Cookie", sRailFeedCookie);
+            httpCode = http.GET();
+        }
+    }
+
     if (httpCode != HTTP_CODE_OK) {
         board.fetchSuccess = false;
         board.errorMessage = (httpCode > 0)
@@ -726,7 +790,10 @@ bool TrainApiClient::fetchRailFeedCallingPoints(
     }
 
     http.addHeader("Accept", "application/json");
-    http.addHeader("User-Agent", "TrainTime-CYD/1.1");
+    http.addHeader("User-Agent", "Mozilla/5.0 (compatible; TrainTime-CYD/1.2)");
+    if (!sRailFeedCookie.isEmpty()) {
+        http.addHeader("Cookie", sRailFeedCookie);
+    }
 
     int httpCode = http.GET();
     if (httpCode != HTTP_CODE_OK) {
